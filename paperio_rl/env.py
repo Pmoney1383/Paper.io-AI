@@ -54,6 +54,15 @@ DEATH_PENALTY_TERRITORY_SCALE = 1.0
 # bonus never punished before.
 TRAIL_PENALTY_SCALE = 0.003
 TRAIL_FREE_POINTS = 10
+# Cost for changing direction on consecutive steps. Once the agent learned to
+# loop back at all, the failure mode became dying by self-intersection from
+# tight, rapid direction changes (small, steep circles). This doesn't forbid
+# turning - closing a loop needs turns - it just makes frantic oscillation
+# between directions cost something, favoring wider, more deliberate loops
+# over frantic tight ones.
+TURN_PENALTY = 0.01
+
+DEFAULT_BOTS_COUNT = 15
 
 
 class PaperIOEnv(gym.Env):
@@ -71,10 +80,18 @@ class PaperIOEnv(gym.Env):
         self._browser = None
         self._page = None
         self._held_key = None
+        self._last_action = None
         self._ticks_this_episode = 0
         self._last_percent = 0.0
+        self._bots_count = DEFAULT_BOTS_COUNT
 
         self._launch()
+
+    def set_bots_count(self, n: int):
+        """Curriculum-learning hook: applied on the *next* reset(), not
+        immediately (mutating mid-episode would change the game out from
+        under whatever the agent is currently reacting to)."""
+        self._bots_count = int(n)
 
     def _launch(self):
         self._playwright = sync_playwright().start()
@@ -135,8 +152,10 @@ class PaperIOEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._release_held_key()
+        self._page.evaluate(hooks.SET_BOTS_COUNT_JS, self._bots_count)
         self._page.evaluate(hooks.RESET_WORLD_JS)
         self._ticks_this_episode = 0
+        self._last_action = None
         if not self.headless:
             self._page.evaluate(hooks.NUDGE_REPAINT_JS)
         obs, info = self._read_obs()
@@ -144,11 +163,14 @@ class PaperIOEnv(gym.Env):
         return obs, info
 
     def step(self, action):
-        key = ARROW_KEYS[int(action)]
+        action = int(action)
+        key = ARROW_KEYS[action]
         if key != self._held_key:
             self._release_held_key()
             self._page.keyboard.down(key)
             self._held_key = key
+        turned = self._last_action is not None and action != self._last_action
+        self._last_action = action
 
         self._page.evaluate(hooks.TICK_N_JS, {"n": TICKS_PER_STEP, "ms": MS_PER_TICK})
         self._ticks_this_episode += TICKS_PER_STEP
@@ -167,6 +189,8 @@ class PaperIOEnv(gym.Env):
         reward = ALIVE_BONUS
         reward += (percent - self._last_percent) * TERRITORY_REWARD_SCALE
         reward -= TRAIL_PENALTY_SCALE * max(0, trail_len - TRAIL_FREE_POINTS)
+        if turned:
+            reward -= TURN_PENALTY
         self._last_percent = percent
 
         terminated = not alive

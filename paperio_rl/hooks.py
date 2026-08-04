@@ -209,6 +209,13 @@ TICK_JS = "(ms) => window.__tick(ms)"
 TICK_N_JS = "({ n, ms }) => window.__tickN(n, ms)"
 GAME_READY_JS = "() => !!(window.__game && window.__game.units && window.__game.units.length)"
 
+# Curriculum learning lever: window.__game.config is the SAME object every
+# create() call reads botsCount from (it's captured once in a closure at
+# page bootstrap, not re-supplied per call) - mutating it before the next
+# resetWorld() changes bot population in the next world. Verified: set to 3,
+# reset, and the resulting world had exactly 3 units.
+SET_BOTS_COUNT_JS = "(n) => { if (window.__game && window.__game.config) window.__game.config.botsCount = n; }"
+
 # Draw calls land on the canvas's own bitmap immediately, but the BROWSER's
 # on-screen compositor only repaints when something asks for a real
 # animation frame - which we intentionally starve everywhere else in this

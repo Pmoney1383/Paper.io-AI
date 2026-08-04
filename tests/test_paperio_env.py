@@ -20,6 +20,7 @@ from paperio_rl.env import (
     DEATH_PENALTY_TERRITORY_SCALE,
     TRAIL_PENALTY_SCALE,
     TRAIL_FREE_POINTS,
+    TURN_PENALTY,
 )
 
 
@@ -74,6 +75,8 @@ class TestPaperIOEnv(unittest.TestCase):
         last_reward = None
         last_percent = 0.0
         last_trail_len = 0
+        prev_action = None
+        final_action = None
         steps = 0
         max_steps = MAX_EPISODE_TICKS // TICKS_PER_STEP + 1
         while not (terminated or truncated) and steps < max_steps:
@@ -81,11 +84,15 @@ class TestPaperIOEnv(unittest.TestCase):
             _, last_reward, terminated, truncated, info = self.env.step(action)
             last_percent = info["percent"]
             last_trail_len = info["trailLen"] or 0
+            prev_action = final_action
+            final_action = action
             steps += 1
         if terminated:
+            turned = prev_action is not None and final_action != prev_action
             expected = (
                 ALIVE_BONUS
                 - TRAIL_PENALTY_SCALE * max(0, last_trail_len - TRAIL_FREE_POINTS)
+                - (TURN_PENALTY if turned else 0.0)
                 + DEATH_PENALTY_BASE
                 - DEATH_PENALTY_TERRITORY_SCALE * last_percent
             )

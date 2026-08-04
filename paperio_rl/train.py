@@ -4,11 +4,16 @@ first visible, the rest headless), creates a fresh PPO model or resumes from
 a saved checkpoint, trains, and checkpoints periodically. Nothing manual -
 just `python -m paperio_rl.train`.
 
+Defaults: 8 parallel envs, 2,000,000 timesteps, curriculum learning enabled
+(bot count ramps 3 -> 15 over the first 40% of timesteps, measured in
+lifetime steps so it survives being resumed across multiple sessions).
+
 Usage:
-    python -m paperio_rl.train                       # default settings
+    python -m paperio_rl.train                       # default settings (8 envs, 2M steps)
     python -m paperio_rl.train --timesteps 5000       # short run (smoke/testing)
-    python -m paperio_rl.train --n-envs 4             # more parallel browsers
+    python -m paperio_rl.train --n-envs 4             # fewer parallel browsers
     python -m paperio_rl.train --headless-first       # even the first env is headless
+    python -m paperio_rl.train --no-curriculum        # full bot count from the start
 """
 import argparse
 import os
@@ -18,8 +23,9 @@ from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from paperio_rl.env import PaperIOEnv
+from paperio_rl.env import PaperIOEnv, DEFAULT_BOTS_COUNT
 from paperio_rl.status_callback import StatusCallback
+from paperio_rl.curriculum_callback import CurriculumCallback
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 MODEL_PATH = os.path.join(CHECKPOINT_DIR, "ppo_paperio.zip")
@@ -46,11 +52,15 @@ def build_vec_env(n_envs: int, headless_first: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="Train a PPO agent to play paperio.site")
-    parser.add_argument("--n-envs", type=int, default=4, help="number of parallel browser envs")
-    parser.add_argument("--timesteps", type=int, default=200_000, help="total training timesteps")
+    parser.add_argument("--n-envs", type=int, default=8, help="number of parallel browser envs")
+    parser.add_argument("--timesteps", type=int, default=2_000_000, help="total training timesteps")
     parser.add_argument("--headless-first", action="store_true", help="run all envs headless (including the first)")
     parser.add_argument("--checkpoint-every", type=int, default=10_000, help="save a checkpoint every N steps")
     parser.add_argument("--status-every", type=int, default=2048, help="print a status line every N steps")
+    parser.add_argument("--curriculum-start-bots", type=int, default=3, help="bot count at the start of training")
+    parser.add_argument("--curriculum-end-bots", type=int, default=DEFAULT_BOTS_COUNT, help="bot count once the curriculum ramp finishes")
+    parser.add_argument("--curriculum-fraction", type=float, default=0.4, help="fraction of --timesteps over which bot count ramps up")
+    parser.add_argument("--no-curriculum", action="store_true", help="disable curriculum learning, use full bot count from the start")
     args = parser.parse_args()
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -87,7 +97,15 @@ def main():
         name_prefix=CHECKPOINT_PREFIX,
     )
     status_callback = StatusCallback(total_timesteps=args.timesteps, print_every_steps=args.status_every)
-    callback = CallbackList([checkpoint_callback, status_callback])
+    callbacks = [checkpoint_callback, status_callback]
+    if not args.no_curriculum:
+        callbacks.append(CurriculumCallback(
+            ramp_timesteps=int(args.timesteps * args.curriculum_fraction),
+            start_bots=args.curriculum_start_bots,
+            end_bots=args.curriculum_end_bots,
+            verbose=1,
+        ))
+    callback = CallbackList(callbacks)
 
     try:
         model.learn(total_timesteps=args.timesteps, callback=callback, reset_num_timesteps=False)
