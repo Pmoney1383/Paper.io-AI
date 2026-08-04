@@ -112,4 +112,96 @@ function readMinimalState() {
   };
 }
 
-module.exports = { installGameHook, installClockHook, installCanvasStub, readMinimalState };
+// Broader snapshot for reset-semantics investigation: world geometry
+// (game.space.cells is a 100x100 spatial-hash grid, each cell holding a
+// .points array of registered geometry points - NOT a fill/occupancy grid;
+// summing points across cells is a proxy for "how much geometry has
+// accumulated"), per-unit state (including dead units, not just count), and
+// game.cycle/seed.
+function snapshotWorld() {
+  const g = window.__game;
+  if (!g) return { ready: false };
+  const cells = g.space && g.space.cells ? g.space.cells : [];
+  let cellsPointCount = 0;
+  let nonEmptyCells = 0;
+  for (const c of cells) {
+    const n = c && c.points ? c.points.length : 0;
+    if (n > 0) nonEmptyCells++;
+    cellsPointCount += n;
+  }
+  const units = (g.units || []).map((u, i) => ({
+    index: i,
+    isPlayer: u === g.player,
+    alive: !u.death,
+    x: u.position ? u.position.x : null,
+    y: u.position ? u.position.y : null,
+    percent: u.percent,
+    baseSquare: u.base ? u.base.square : null,
+    trailPoints: u.track && u.track.simplyline ? u.track.simplyline.length : null,
+  }));
+  return {
+    ready: true,
+    cycle: g.cycle,
+    seed: g.seed,
+    unitCount: g.units ? g.units.length : null,
+    cellsPointCount,
+    nonEmptyCells,
+    units,
+    player: g.player ? {
+      x: g.player.position.x,
+      y: g.player.position.y,
+      percent: g.player.percent,
+      alive: !g.player.death,
+    } : null,
+  };
+}
+
+// Genuine world reset, found via static analysis of app2.js: the site's own
+// "return to menu" flow does
+//   api.game.stopped = true; api.create(canvasEl); api.prepare(callback);
+// where api === window.paperio2api (window.paperio2api.game is the same
+// object as our push-hook-captured window.__game). create() builds a brand
+// new spatial hash + border + game instance; prepare() gradually spawns
+// bases/bots via a real setInterval (NOT driven by our virtual clock - this
+// is genuine wall-clock cost, unlike everything else in this spike) and
+// resolves its callback once done. Verified via before/after snapshots:
+// cycle and cellsPointCount both drop sharply (not just churn), and every
+// bot's baseSquare resets to the same fresh-spawn baseline (~2820).
+//
+// IMPORTANT: create() replaces the game object, so our push-hook's cached
+// window.__game goes stale - this function re-points it at
+// window.paperio2api.game after prepare() resolves, then spawns the player
+// via the already-confirmed spawnPlayer() pure-function call.
+function resetWorld() {
+  return new Promise((resolve, reject) => {
+    const api = window.paperio2api;
+    if (!api) { reject(new Error('window.paperio2api not found')); return; }
+    // prepare()'s completion callback depends on a real setInterval, not our
+    // virtual clock - normally resolves in ~10-50ms, but has no guarantee.
+    // Without a fallback, a stuck callback hangs page.evaluate() forever
+    // (the returned promise eventually just gets garbage collected, which
+    // surfaces as an opaque Playwright error, not a catchable timeout).
+    // Fatal for unattended training, so always resolve one way or another.
+    const timeoutId = setTimeout(() => {
+      window.__game = api.game;
+      try { window.__game.spawnPlayer(); } catch (e) {}
+      resolve({ timedOut: true });
+    }, 8000);
+    try {
+      if (api.game) api.game.stopped = true;
+      const canvas = document.getElementById('view') || document.querySelector('canvas');
+      api.create(canvas);
+      api.prepare(() => {
+        clearTimeout(timeoutId);
+        window.__game = api.game;
+        try { window.__game.spawnPlayer(); } catch (e) {}
+        resolve({ timedOut: false });
+      });
+    } catch (e) {
+      clearTimeout(timeoutId);
+      reject(e);
+    }
+  });
+}
+
+module.exports = { installGameHook, installClockHook, installCanvasStub, readMinimalState, snapshotWorld, resetWorld };
