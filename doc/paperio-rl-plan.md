@@ -1,134 +1,148 @@
-# paper.io RL Agent — Project Plan
+# paper.io RL Agent — Project Plan (v2, post-recon)
 
-Train a neural network via reinforcement learning to play the **live** paper.io browser game, using computer vision for state extraction.
+Train a neural network via reinforcement learning to play **Paper.io 2** (paperio.site).
+
+> **v2 changes:** Phase 0 recon found the game is fully client-side with complete state exposed in JS. **Phase 1 (CV perception) is cut entirely.** Time control is now possible, which collapses the throughput problem. See findings below.
 
 ---
 
-## Stack
+## Phase 0 findings — RESOLVED ✅
+
+**paperio.site is Paper.io 2, fully client-side. No game server.**
+- Zero `wss://` / WebSocket references in the ~240KB `app2.js` bundle. Only websocket in session is Yandex analytics.
+- Entire simulation runs as a plain in-memory object graph.
+
+### Exposed state (replaces everything CV was going to approximate)
+
+Every `Unit` carries `unit.game`, a reference to the root singleton — reachable from anywhere.
+
+| Path | Contents |
+|---|---|
+| `game.player` | `position {x,y}`, `percent`/`bestPercent` (exact territory %), `death`, `direction` (radians), `track.polyline`/`simplyline` (trail), `base.polygon` (owned territory), `in.polygon` (swept-but-unclaimed) |
+| `game.units[]` | 16 units (1 player + `botsCount: 15`), same shape as player, plus bot AI internals: `aggro`, `greed`, `safety`, `def`, `targets`, `maxDanger`, `unitDanger`, `distanceDanger` |
+| `game.space` | Arena grid — `width/height: 2000`, `w/h: 100` cells of `size: 20`, spatial-hash `cells[]` |
+| `game.border` | Boundary polygon, `radius: 950`, center |
+| `game.config` | `unitSpeed: 90`, `baseRadius: 30`, `botsCount: 15`, `trackWidth: 8`, `spawnTimeout: 3000`, bot aggro/greed/safety/def ranges |
+| `game.controller` | Both discrete `up/down/left/right` AND continuous `mouse` angle-steering, plus `buttons`/`codes`/`pressedButtons` |
+| `game.cycle`, `game.last`, `game.stats.fps` | Loop timing |
+
+### Access bootstrap
+No clean `window.game`. Hook `Array.prototype.push` via `page.addInitScript()` **before navigation**, capture the first Unit-shaped object, read `.game` off it, cache as `window.__game`. One-time, reliable. Afterwards `page.evaluate()` is plain object access against a **live reference**, not a copy.
+
+### Rendering
+Single `<canvas id="view">`, 2D context (not WebGL), viewport-sized. **Irrelevant now** — we never read pixels.
+
+---
+
+## Consequences (the parts that reshape the plan)
+
+### 1. Time decoupling — the big one
+No server means **nothing is authoritative except the tab**. Override `requestAnimationFrame` / `performance.now()` / `Date.now()` via `addInitScript` and drive the loop manually — pump N ticks per `evaluate()` call instead of waiting on wall-clock.
+
+The original ~30hr training estimate assumed being locked to a live server tick. **That constraint doesn't exist.** Combined with stubbing canvas draw calls (pure waste now), a single instance could plausibly hit **100–1000× real-time**.
+
+→ Parallel browsers drop from "main throughput fix" to "nice-to-have, maybe unnecessary."
+
+### 2. Kill the ad gate, don't script around it
+Site is heavy with ad-tech (adinplay, doubleclick, rubicon, prebid, gameads.io) and forces a ~30s video interstitial after PLAY.
+- Playwright `route()` → abort those domains.
+- Better: find the game's start/restart function on the object graph and **call it directly**. `reset()` becomes a function call, not a UI dance.
+
+### 3. Observation space — still a grid, but exact
+Tempting to feed a flat state vector now. Don't — a vector of "my position + 15 bot positions" discards **territory shape**, which is the actual game. Spatial structure is what makes the CNN worth using.
+
+Rasterize exactly from `base.polygon` / `in.polygon` / `game.space.cells` instead of approximating from pixels.
+
+**Check first:** if `space.cells` (100×100) is already an ownership grid, it's a single `cv2.resize(..., INTER_NEAREST)` down to 40×40 and you're done — zero geometry work. (`INTER_NEAREST` matters: nearest-neighbor preserves discrete class labels; bilinear blends your territory into an enemy's and produces garbage cells.)
+
+### 4. Bot AI fields are a trap
+`aggro`/`greed`/`safety`/`unitDanger` are visible and tempting. **Do not put them in the observation** — that's info a real opponent wouldn't broadcast, and you'd train a policy that can't function without it. Fine to use *offline* for reward shaping or curriculum design.
+
+### 5. Scope honesty
+15 fixed-AI bots = "mastering paper.io 2" means beating a **static bot roster**. No opponent adaptation; once you beat them, you're done. Raise `botsCount` for a difficulty curriculum if you want the challenge to scale.
+
+### 6. Seed the RNG
+Find it and fix it. Reproducible episodes make RL debugging vastly less painful.
+
+---
+
+## Stack (revised)
 
 | Component | Choice | Why |
 |---|---|---|
-| Browser control | Playwright (Chromium, headless) | Scriptable, CDP access, multi-context |
-| Frame capture | **CDP `Page.startScreencast`** @ ~30fps | Push-based stream, not request/response |
-| CV | OpenCV + numpy | Color masking, contours, downsampling |
-| RL | `stable-baselines3` PPO | Discrete action space, batteries included |
-| Compute | RTX 5080 | Mostly idle — bottleneck is the game, not the GPU |
-| Parallelism | **4 headless browser contexts** | ~130k steps/hr without pegging CPU |
+| Browser control | Playwright (Chromium, headless) | Scriptable, `addInitScript`, multi-context |
+| State extraction | **`page.evaluate()` against `window.__game`** | Exact, cheap — replaces screencast + OpenCV |
+| Frame capture | ~~CDP screencast~~ | **Cut** — no pixels needed |
+| CV | OpenCV (`resize` only, if even that) | Grid downsampling; the masking pipeline is gone |
+| RL | `stable-baselines3` PPO | Discrete action space |
+| Time control | `rAF`/`Date.now` override + canvas stubbing | Decouples sim from wall-clock |
+| Compute | RTX 5080 | Now actually usable — the game was the old bottleneck |
 
 ---
 
-## Key design decisions (settled)
+## ~~Phase 1 — Perception~~ CUT
 
-### Capture vs. decision rate
-- **Capture at ~30fps** via CDP screencast — smooth, push-based, no repaint stalls.
-- **Act at ~10Hz** (every 3rd frame), holding the action in between.
-- Do NOT use `page.screenshot()` for the loop — it's request/response over CDP, forces a repaint, PNG-encodes, and realistically yields 5–15fps with 300ms stalls. Debug/one-off frames only.
-- Fallback if screencast misbehaves: `mss` (native OS grab, 60fps+, but window position/scaling becomes your problem).
-- **Why not act at 30Hz:** at 30fps a single action barely changes the world, so credit assignment gets brutal and the agent learns *worse and slower*. Frame-skip is standard RL practice.
-
-### Why a CNN, and how it emits an action
-The CNN is a **feature extractor**, not an action predictor. Full path:
-
-```
-40x40x5 grid → [3 conv layers] → flatten → [FC layers] → 4 logits (U/D/L/R) → softmax → sample
-```
-
-- Conv stack compresses the spatial grid into features ("enemy trail close on the right, open territory ahead").
-- A small fully-connected **policy head** maps those features to 4 scores, one per direction.
-- Training: sample from softmax (exploration). Eval: argmax.
-
-**Why not a plain MLP?** At 40×40 an MLP would technically work, but the CNN buys two things:
-- *Translation invariance* — an enemy trail 5px to your left looks the same anywhere on the grid, so one learned filter is reused everywhere instead of a separate weight per cell.
-- *Spatial locality* — conv kernels bake in "nearby pixels are related"; an MLP has to brute-force learn that.
-
-Result: far fewer parameters, faster convergence, better generalization to unseen territory shapes. This is the canonical Atari-style CNN-PPO setup — nothing exotic.
-
-### Why the occupancy grid instead of raw pixels
-Going full CNN-on-raw-pixels turns this into a semantic segmentation project and drags in enemy-identity tracking across frames. Color-mask → downsampled grid gets a working prototype in a week instead of a month.
+Color masking, contour detection, enemy color-clustering, the debug-overlay gate — **all unnecessary.** State is exact and free.
 
 ---
 
-## Phase 0 — Recon (~1 hr)
-
-**Do this before writing a single line of CV code.**
-
-- [ ] Open paper.io, pop the browser console, dig through `window` globals for exposed game state (player coords, territory, enemy positions).
-- [ ] **If state is exposed:** `page.evaluate()` it out and the entire CV pipeline evaporates — clean numeric state at 60fps, zero segmentation work. 30 minutes of digging that could save two days.
-- [ ] If fully bundled/minified with nothing exposed → proceed with pixels.
-- [ ] Identify the canvas element, its resolution, and whether it's 2D canvas or WebGL.
-- [ ] Record ~60s of raw frames to disk. **Reuse this footage constantly** for offline CV tuning without needing a live browser.
-
----
-
-## Phase 1 — Perception (~1 day, the real work)
-
-Build `extract_state(frame) -> dict`, developed against **recorded footage**, not live.
-
-- [ ] Sample actual hex values from your recordings — do not guess colors.
-- [ ] Color-mask each entity class:
-  - your territory
-  - your trail
-  - enemy territory
-  - enemy trails
-  - background / open space
-- [ ] Locate your head position + trail via contour detection.
-- [ ] Enemies: use a lightweight **per-frame color-clustering pass**. Do NOT try to track enemy identities across frames — for v1 you only need "enemy trail pixels near me" as a collision-risk feature.
-- [ ] Territory measurement: color-mask + `cv2.countNonZero`. This is the easy part.
-- [ ] Output: **40×40×5 occupancy grid centered on the player**, plus scalars (territory %, alive/dead flag).
-
-**Gate:** overlay the extracted grid back onto the source frame as a debug visualization and eyeball 200 frames. If perception is wrong here, everything downstream is garbage and you won't be able to tell why.
-
-> Known failure mode: color masks breaking when an enemy's territory color sits too close to yours. Budget time for it.
-
----
-
-## Phase 2 — Environment wrapper (~half day)
+## Phase 1 (new) — Environment wrapper
 
 Gym-style `PaperIOEnv` with `reset()` / `step(action)`.
 
-- [ ] `reset()`: template-match the death screen → click "play again" → wait for spawn.
-- [ ] `step(action)`: send arrow key via Playwright → wait one frame-skip interval → grab latest screencast frame → extract state → compute reward.
-- [ ] Action space: **discrete(4)** — matches paper.io's native controls, no continuous control needed.
-- [ ] Reward shaping (raw territory alone is far too sparse — you'll die 100× before capturing anything):
+- [ ] `addInitScript`: hook `Array.prototype.push` → cache `window.__game`.
+- [ ] `addInitScript`: override `requestAnimationFrame` / `performance.now()` / `Date.now()` for manual tick control.
+- [ ] `addInitScript`: stub canvas 2D draw calls (no-op the context methods).
+- [ ] `route()` abort on ad domains.
+- [ ] `reset()`: call the game's start/restart directly. Hook `game.gameOverCallback` and/or poll `game.player.death` for episode end — **no death-screen template matching needed**.
+- [ ] `step(action)`: set `game.controller` input → pump N ticks → read state → build observation → compute reward.
+- [ ] **Action space: discrete(4)** (`up/down/left/right`). Continuous `mouse` angle-steering is also available — we get to *choose* rather than being forced by pixel-input limits. Start discrete; it's a smaller space and matches the grid observation.
+- [ ] Observation: 40×40×N grid (own territory / own trail / enemy territory / enemy trails / open), frame-stacked ×4.
+
+### Reward shaping
+Raw territory is far too sparse — the agent dies ~100× before capturing anything.
 
 | Event | Reward |
 |---|---|
 | Per step alive | `+0.01` |
-| Distance traveled outside own territory | small positive (encourages expansion attempts) |
-| New territory claimed (loop closure) | `+0.1 × new_territory_pixels` |
+| Distance traveled outside own base | small positive (encourages expansion) |
+| Territory claimed (loop closure) | `+0.1 × Δpercent` — now **exact**, via `player.percent`, not pixel-counted |
 | Death | `-1 - 0.5 × territory_held` |
 
-Scaling the death penalty by territory held makes dying with a big base hurt more than dying instantly.
+Scaling death penalty by territory held makes dying with a big base hurt more than dying instantly.
 
-**Gate:** run a random-action agent for 50 episodes. If `reset()` doesn't succeed 50/50 times, fix that before training anything.
+**Gate:** random-action agent, 50 episodes. `reset()` must succeed 50/50 before training anything.
 
 ---
 
-## Phase 3 — Agent (~half day to write)
+## Phase 2 — Agent
 
 - [ ] PPO from `stable-baselines3`.
-- [ ] Small CNN over the 40×40×5 grid — 3 conv layers is plenty, this isn't ImageNet.
-- [ ] **Frame-stack 4 observations** so the policy can infer motion/direction.
-- [ ] ~150 lines of boilerplate. This is the easy phase.
+- [ ] Small CNN over the 40×40×N grid → flatten → FC head → 4 logits → softmax. 3 conv layers is plenty.
+- [ ] Frame-stack 4 so the policy can infer motion/direction.
+- [ ] ~150 lines of boilerplate.
 
-**Wall-clock reality check:**
-- 1 instance @ 10Hz ≈ **36k steps/hour**
-- PPO typically wants **1M+ steps** → ~30 hours single-instance
-- 4 instances @ ~90% uptime ≈ **130k steps/hour** → **~8 hours**, a workable weekend
+**Why a CNN:** it's a *feature extractor*, not an action predictor. Conv stack compresses the grid into features ("enemy trail close on the right, open territory ahead"); a small FC **policy head** maps those to 4 direction scores. Sample from softmax when training, argmax at eval.
+Over a plain MLP it buys *translation invariance* (one filter reused everywhere vs. a separate weight per cell) and *spatial locality* (baked into conv kernels; an MLP brute-forces it). Fewer params, faster convergence, better generalization to unseen territory shapes.
 
 ---
 
-## Phase 4 — Throughput (pick one, in order of cheapness)
+## Phase 3 — Throughput
 
-1. **Parallel envs — 4 headless contexts.** Cheapest win, do this first. Bottleneck is CPU (Chrome rendering + per-frame CV), not GPU; the 5080 stays mostly idle during rollout collection. Run headless — no reason to render 4 visible windows.
-   - **Start with 1 instance** until Phases 1–2 are solid. Debugging a flaky color mask across 4 parallel streams is miserable.
-2. **Offline clone.** Reimplement paper.io mechanics in numpy, train at 10k+ steps/sec, transfer to the live site using the same observation format. Fastest path to a genuinely *good* agent; cost is the sim-to-real gap.
-3. **Behavior cloning warmstart.** Record 30 min of your own play, pretrain the policy on `(grid, action)` pairs, then RL on top. Eliminates the random-flailing phase entirely.
+**Try in this order — you may stop after step 1.**
+
+1. **Time acceleration** (see Consequence #1). Ticks-per-second, not steps-per-hour. Measure actual speedup before adding complexity.
+2. **Batch `evaluate()` calls.** IPC round-trips are the remaining per-step cost — pump multiple ticks and return a batched observation in one call rather than one call per tick.
+3. **Parallel contexts (4).** Only if 1+2 aren't enough. Headless, obviously.
+4. ~~Offline numpy clone~~ — **moot.** The game *is* local now; a reimplementation buys nothing and adds sim-to-real gap.
+5. **Behavior cloning warmstart.** Still valid — record 30 min of your own play, pretrain on `(grid, action)` pairs, RL on top. Skips the random-flailing phase.
 
 ---
 
-## Honest scoping
+## Revised scoping
 
-**Phases 0–2 are the project.** Phase 3 is stable-baselines3 boilerplate. The common failure mode is getting excited about the RL and then losing four days to color-mask debugging you didn't plan for.
+The original doc said "Phases 0–2 are the project, Phase 3 is boilerplate." **Recon invalidated that.** The hard part (perception) evaporated, and the throughput ceiling lifted with it.
 
-Build order: **recon → perception → env → agent → scale.** Don't skip the gates.
+What's left: env wrapper (tick control + reset plumbing is now the fiddliest bit), then mostly standard PPO tuning and reward shaping.
+
+Build order: **env wrapper → verify reset reliability → agent → measure time-accel ceiling → scale only if needed.**

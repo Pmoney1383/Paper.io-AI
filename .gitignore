@@ -1,0 +1,22 @@
+node_modules/
+recon/app2.js
+recon/*.png
+recon/footage/
+recon/ext/
+recon/.pw-profile/
+recon/episode_samples.json
+*.log
+
+# Playwright
+playwright-report/
+test-results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
